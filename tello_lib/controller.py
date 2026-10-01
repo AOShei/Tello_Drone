@@ -1,414 +1,506 @@
+"""High-level controller for a Tello drone."""
+
+from __future__ import annotations
+
+import logging
 import socket
 import threading
 import time
-import logging
+from dataclasses import replace
+from typing import Callable, Iterator, Optional, Type
+
 import numpy as np
-from typing import Optional, Tuple
-from .models import DroneState, DroneStatus, CommandPriority
+
 from .command_handler import CommandHandler
-from .video import VideoStream
 from .exceptions import (
-    DroneConnectionError,
     CommandError,
-    VideoStreamError,
-    TakeoffError,
+    CommandTimeoutError,
+    DroneConnectionError,
     LandingError,
     MovementError,
     RotationError,
-    SpeedCommandError
+    SpeedCommandError,
+    TakeoffError,
+    TelloError,
 )
+from .models import DroneState, DroneStatus, VideoStreamState
+from .video import VideoStream
 
 logger = logging.getLogger(__name__)
 
 
 class TelloController:
-    # Define the status update mapping at class level
-    STATUS_UPDATES = [
-        (0, lambda status, v: setattr(status, 'pitch', int(v))),
-        (1, lambda status, v: setattr(status, 'roll', int(v))),
-        (2, lambda status, v: setattr(status, 'yaw', int(v))),
-        (3, lambda status, v: setattr(status.velocity, 'x', float(v))),
-        (4, lambda status, v: setattr(status.velocity, 'y', float(v))),
-        (5, lambda status, v: setattr(status.velocity, 'z', float(v))),
-        (6, lambda status, v: setattr(status.temperature, 'low', int(v))),
-        (7, lambda status, v: setattr(status.temperature, 'high', int(v))),
-        (8, lambda status, v: setattr(status, 'time_of_flight', int(v))),
-        (9, lambda status, v: setattr(status, 'altitude', int(v))),
-        (10, lambda status, v: setattr(status, 'battery', int(v))),
-        (11, lambda status, v: setattr(status, 'barometric_pressure', float(v))),
-        (12, lambda status, v: setattr(status, 'time', int(v))),
-        (13, lambda status, v: setattr(status.acceleration, 'x', float(v))),
-        (14, lambda status, v: setattr(status.acceleration, 'y', float(v))),
-        (15, lambda status, v: setattr(status.acceleration, 'z', float(v)))
-    ]
+    """Controls a Tello over its Wi-Fi text SDK.
 
-    def __init__(self):
+    Use it as a context manager to make sure the drone lands and all
+    resources are released, even if your code raises::
+
+        with TelloController() as drone:
+            drone.takeoff()
+            drone.move("forward", 50)
+            drone.land()
+
+    Commands raise a :class:`~tello_lib.exceptions.TelloError` subclass when
+    they fail.
+    """
+
+    MIN_ALTITUDE = 10  # cm, above this the drone is considered airborne
+    TAKEOFF_TIMEOUT = 20.0
+    LAND_TIMEOUT = 20.0
+    MOVE_TIMEOUT = 20.0
+    STATUS_MAX_AGE = 2.0  # seconds, older telemetry is not trusted
+
+    def __init__(self, host: str = '192.168.10.1', *, command_port: int = 8889,
+                 local_command_port: int = 8889, status_port: int = 8890,
+                 video_port: int = 11111):
+        """
+        Args:
+            host: IP address of the drone
+            command_port: UDP port the drone listens on for commands
+            local_command_port: Local UDP port commands are sent from
+            status_port: Local UDP port the drone sends its telemetry to
+            video_port: Local UDP port the drone sends its video to
+        """
+        self._command_handler = CommandHandler((host, command_port), local_command_port)
+        self._video = VideoStream(f"udp://0.0.0.0:{video_port}")
+        self._status_port = status_port
+
+        self._state = DroneState.DISCONNECTED
         self._status = DroneStatus()
-        self._command_handler = CommandHandler()
-        self._video = VideoStream()
-        
-        # Status socket
-        self._status_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._status_socket.bind(('', 8890))
-        
+        self._status_received = threading.Event()
+
         # Status monitoring
+        self._status_socket: Optional[socket.socket] = None
+        self._status_thread: Optional[threading.Thread] = None
         self._running = False
-        self._status_thread = threading.Thread(target=self._status_loop)
-        self._status_thread.daemon = True
-        self.MIN_ALTITUDE = 10
 
-    def connect(self) -> bool:
-        """Initialize connection to the drone"""
+    def __enter__(self) -> "TelloController":
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.is_flying:
+            try:
+                self.land()
+            except TelloError as e:
+                logger.error("Failed to land on exit: %s", e)
+        self.disconnect()
+
+    # ------------------------------------------------------------------
+    # Connection
+    # ------------------------------------------------------------------
+
+    def connect(self):
+        """
+        Initialize connection to the drone
+
+        Raises:
+            DroneConnectionError: If the drone does not respond or the local
+                ports are unavailable
+        """
+        if self._state != DroneState.DISCONNECTED:
+            return
+
         try:
-            logger.info("Starting command handler...")
-            # Start command handler and wait for threads to initialize
             self._command_handler.start()
+            self._start_status_monitor()
 
-            logger.info("Sending initial command to enter SDK mode...")
-            # Enter SDK mode
-            response = self._command_handler.send_command(
-                "command",
-                priority=CommandPriority.HIGH
+            logger.info("Entering SDK mode...")
+            response = self._command_handler.send_command("command", timeout=3.0, retries=2)
+            if response.lower() != "ok":
+                raise DroneConnectionError(f"Unexpected response during connection: {response}")
+        except TelloError as e:
+            self._release()
+            if isinstance(e, DroneConnectionError):
+                raise
+            raise DroneConnectionError(
+                f"Failed to connect to drone: {e}. Is this computer on the drone's Wi-Fi network?"
+            ) from e
+
+        self._state = DroneState.CONNECTED
+        logger.info("Connected to drone")
+
+        # Telemetry arrives ~10 times a second, give the first packet a moment
+        # so get_battery() and friends are usable right away
+        if not self._status_received.wait(timeout=2.0):
+            logger.warning(
+                "No telemetry received on UDP port %d, check your firewall", self._status_port
             )
 
-            if response == "ok":
-                logger.info("Successfully entered SDK mode")
+    def disconnect(self):
+        """Disconnect from the drone and release all resources
 
-                # Start status monitoring
-                self._running = True
-                self._status_thread.start()
+        This does not land the drone. Without commands it lands on its own
+        after 15 seconds.
+        """
+        if self._state == DroneState.DISCONNECTED:
+            return
+        if self.is_flying:
+            logger.warning("Disconnecting while the drone is still flying")
 
-                self._status.state = DroneState.CONNECTED
-                return True
-            else:
-                raise DroneConnectionError(f"Unexpected response during connection: {response}")
+        if self._video.get_state() != VideoStreamState.DISCONNECTED:
+            try:
+                self.stop_video_stream()
+            except TelloError as e:
+                logger.warning("Failed to stop video stream: %s", e)
 
-        except DroneConnectionError as e:
-            logger.error(f"Failed to connect to drone: {e}")
-            self._status.state = DroneState.ERROR
-            return False
-        except Exception as e:
-            logger.error(f"Unexpected error during connection: {e}")
-            self._status.state = DroneState.ERROR
-            return False
+        self._release()
+        logger.info("Disconnected from drone")
 
-    def disconnect(self) -> bool:
-        """Disconnect from the drone and cleanup resources"""
+    def _release(self):
+        self._running = False
+        thread, self._status_thread = self._status_thread, None
+        if thread and thread.is_alive():
+            thread.join(timeout=2.0)
+        sock, self._status_socket = self._status_socket, None
+        if sock is not None:
+            sock.close()
+
+        self._video.stop()
+        self._command_handler.stop()
+        self._status_received.clear()
+        self._status = DroneStatus()
+        self._state = DroneState.DISCONNECTED
+
+    # ------------------------------------------------------------------
+    # Telemetry
+    # ------------------------------------------------------------------
+
+    def _start_status_monitor(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            # Stop status monitoring
-            self._running = False
-            if self._status_thread.is_alive():
-                self._status_thread.join()
+            sock.bind(('', self._status_port))
+        except OSError as e:
+            sock.close()
+            raise DroneConnectionError(
+                f"Could not bind UDP port {self._status_port}: {e}. "
+                "Is another program already talking to the drone?"
+            ) from e
+        sock.settimeout(1.0)
 
-            # Cleanup resources
-            self._video.stop()
-            self._command_handler.stop()
-            self._status_socket.close()
+        self._status_socket = sock
+        self._running = True
+        self._status_thread = threading.Thread(
+            target=self._status_loop, args=(sock,), name="tello-status", daemon=True
+        )
+        self._status_thread.start()
 
-            self._status.state = DroneState.DISCONNECTED
-            return True
-        except Exception as e:
-            logger.error(f"Error during disconnect: {e}")
-            return False
-
-    def _parse_speed(self, speed_str: str) -> int:
-        """Parse speed response from drone"""
-        try:
-            # Remove any non-digit characters except decimal point
-            num = ''.join(c for c in speed_str if c.isdigit() or c == '.')
-            return int(float(num))
-        except Exception as e:
-            logger.error(f"Failed to parse speed: {speed_str} - {e}")
-            return 0
-
-    def _status_loop(self):
+    def _status_loop(self, sock: socket.socket):
         """Status monitoring loop"""
-        self._status_socket.settimeout(1.0)
-
         while self._running:
             try:
-                data, _ = self._status_socket.recvfrom(1024)
-                raw_status = data.decode('utf-8').strip()
-                logger.debug(f"Status Message: {raw_status}")
-                
-                values = [item.split(':')[1] for item in raw_status.split(';') if ':' in item]
-                
-                # Use self.STATUS_UPDATES or DroneController.STATUS_UPDATES
-                for idx, update_func in self.STATUS_UPDATES:
-                    try:
-                        if idx < len(values):
-                            update_func(self._status, values[idx])
-                    except ValueError:
-                        continue
-                
-                # self.log_status()
+                data, _ = sock.recvfrom(1024)
             except socket.timeout:
                 continue
-            except Exception as e:
-                logger.error(f"Status update failed: {e}")
+            except OSError:
+                break  # Socket closed
+
+            try:
+                raw_status = data.decode('utf-8', errors='replace')
+                self._status = DroneStatus.from_state_string(raw_status, time.monotonic())
+                self._status_received.set()
+            except ValueError as e:
+                logger.debug("Ignoring malformed status packet: %s", e)
+
+    def _fresh_altitude(self) -> Optional[int]:
+        """Altitude in cm from recent telemetry, None if telemetry is missing or stale"""
+        status = self._status
+        if not status.timestamp or time.monotonic() - status.timestamp > self.STATUS_MAX_AGE:
+            return None
+        return status.altitude
+
+    @property
+    def state(self) -> DroneState:
+        """Current connection/flight state"""
+        return self._state
+
+    @property
+    def is_flying(self) -> bool:
+        return self._state in (DroneState.FLYING, DroneState.FLYING_UNSTABLE)
+
+    def get_status(self) -> DroneStatus:
+        """Get a snapshot of the current drone status"""
+        return replace(self._status, state=self._state)
+
+    def get_battery(self) -> int:
+        """Get battery percentage"""
+        if self._status_received.is_set():
+            return self._status.battery
+        response = self.send_command("battery?", retries=2)
+        try:
+            return int(float(response))
+        except ValueError:
+            raise CommandError(f"Unexpected response to battery query: {response}") from None
+
+    def get_height(self) -> int:
+        """Get current height above the takeoff point in centimeters"""
+        return self._status.altitude
 
     def log_status(self):
         """Log all drone status values for debugging"""
+        s = self._status
         logger.info(
-            f"Drone[BAT:{self._status.battery}% "
-            f"POS(p:{self._status.pitch}° r:{self._status.roll}° y:{self._status.yaw}°) "
-            #f"VEL({self._status.velocity.x:.1f},{self._status.velocity.y:.1f},{self._status.velocity.z:.1f}) "
-            #f"ACC({self._status.acceleration.x:.1f},{self._status.acceleration.y:.1f},{self._status.acceleration.z:.1f}) "
-            f"ALT:{self._status.altitude}cm TOF:{self._status.time_of_flight}cm "
-            f"TEMP({self._status.temperature.low}°C,{self._status.temperature.high}°C) "
-            #f"BARO:{self._status.barometric_pressure:.1f}hPa "
-            f"TIME:{self._status.time} STATE:{self._status.state.name}]"
+            "Drone[BAT:%d%% POS(p:%d° r:%d° y:%d°) ALT:%dcm TOF:%dcm "
+            "TEMP(%d°C,%d°C) TIME:%ds STATE:%s]",
+            s.battery, s.pitch, s.roll, s.yaw, s.altitude, s.tof_distance,
+            s.temperature.low, s.temperature.high, s.motor_time, self._state.name,
         )
 
-    def start_video_stream(self, timeout: int = 15) -> bool:
-        """Start video stream"""
+    # ------------------------------------------------------------------
+    # Commands
+    # ------------------------------------------------------------------
+
+    def send_command(self, command: str, timeout: float = 7.0, retries: int = 0) -> str:
+        """
+        Send a raw SDK command and return the drone's response
+
+        Use this for SDK commands that have no dedicated method.
+
+        Raises:
+            CommandTimeoutError: If the drone did not respond
+        """
+        return self._command_handler.send_command(command, timeout=timeout, retries=retries)
+
+    def _send_expect_ok(self, command: str, error: Type[CommandError] = CommandError,
+                        timeout: float = 7.0, retries: int = 0):
+        response = self.send_command(command, timeout=timeout, retries=retries)
+        if response.lower() != "ok":
+            raise error(f"Drone rejected '{command}': {response}")
+
+    def takeoff(self):
+        """
+        Take off the drone
+
+        Raises:
+            TakeoffError: If the drone did not take off
+        """
+        if self._state not in (DroneState.CONNECTED, DroneState.LANDED):
+            raise TakeoffError(f"Cannot take off while {self._state.value}")
+
         try:
-            response = self._command_handler.send_command(
-                "streamon",
-                priority=CommandPriority.NORMAL
-            )
+            response = self.send_command("takeoff", timeout=self.TAKEOFF_TIMEOUT)
+        except CommandTimeoutError:
+            response = None
 
-            if response == "ok":
-                logger.info("Video streamon command accepted")
-                # Start and wait for video stream
-                return self._video.start(timeout=timeout)
+        if response is not None and response.lower() == "ok":
+            self._state = DroneState.FLYING
+            logger.info("Takeoff complete")
+            return
+
+        # The drone can be airborne even though the command reported a
+        # problem, the telemetry tells
+        time.sleep(2)
+        altitude = self._fresh_altitude()
+        if altitude is not None and altitude > self.MIN_ALTITUDE:
+            if response is not None and "imu" in response.lower():
+                self._state = DroneState.FLYING_UNSTABLE
             else:
-                raise VideoStreamError(f"Unexpected response to video streamon command: {response}")
+                self._state = DroneState.FLYING
+            logger.warning("Drone is airborne despite takeoff response: %s", response)
+            return
 
-        except VideoStreamError as e:
-            logger.error(f"Video stream error: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Failed to start video stream: {e}")
-            return False
+        raise TakeoffError(f"Takeoff failed: {response or 'no response'}")
 
-    def stop_video_stream(self) -> bool:
-        """Stop video stream"""
+    def land(self):
+        """
+        Land the drone
+
+        Raises:
+            LandingError: If the landing could not be confirmed
+        """
         try:
-            self._video.stop()
-            response = self._command_handler.send_command(
-                "streamoff",
-                priority=CommandPriority.NORMAL
-            )
+            response = self.send_command("land", timeout=self.LAND_TIMEOUT)
+        except CommandTimeoutError:
+            response = None
 
-            if response == "ok":
-                logger.info("Video streamoff command accepted")
-                return True
-            else:
-                raise VideoStreamError(f"Unexpected response to video streamoff command: {response}")
-                
-        except VideoStreamError as e:
-            logger.error(f"Video stream error: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Failed to start video stream: {e}")
-            return False
+        if response is not None and response.lower() == "ok":
+            self._state = DroneState.LANDED
+            logger.info("Landing complete")
+            return
 
-    def takeoff(self) -> bool:
-        """Take off the drone"""
+        # Check if drone actually landed despite the error
+        time.sleep(3)
+        altitude = self._fresh_altitude()
+        if altitude is not None and altitude <= self.MIN_ALTITUDE:
+            self._state = DroneState.LANDED
+            logger.warning("Drone is on the ground despite land response: %s", response)
+            return
+
+        raise LandingError(f"Landing not confirmed: {response or 'no response'}")
+
+    def emergency(self):
+        """Stop all motors immediately. The drone will drop, use land() if you can."""
         try:
-            if self._status.state != DroneState.CONNECTED:
-                raise CommandError("Drone must be connected before takeoff")
-            
-            response = self._command_handler.send_command(
-                "takeoff",
-                priority=CommandPriority.HIGH
-            )
-            
-            if response is None:
-                raise TakeoffError("No response received for takeoff command")
-                
-            if response == "ok" or "error No valid imu" in response:
-                # Verify takeoff
-                time.sleep(2)
-                if self.get_height() > self.MIN_ALTITUDE:
-                    self._status.state = DroneState.FLYING
-                    if "error No valid imu" in response:
-                        self._status.state = DroneState.FLYING_UNSTABLE
-                    logger.info("Takeoff confirmed - drone is airborne")
-                    return True
-                else:
-                    raise TakeoffError(f"Failed to gain altitude")
-            else:
-                raise TakeoffError(f"Unexpected response to takeoff: {response}")
-            return False
-                
-        except TakeoffError as e:
-            logger.error(f"Takeoff error: {e}")
-            # Check if drone is actually flying despite the error
-            if self.get_height() > self.MIN_ALTITUDE:
-                logger.warning("Drone appears to be flying despite takeoff command error")
-                self._status.state = DroneState.FLYING
-                return True
-            return False
+            self.send_command("emergency", timeout=2.0, retries=2)
+        finally:
+            self._state = DroneState.LANDED
 
+    def move(self, direction: str, distance: int):
+        """
+        Move the drone in a direction
 
-    def land(self) -> bool:
-        """Land the drone"""
-        try:
-            response = self._command_handler.send_command(
-                "land",
-                priority=CommandPriority.EMERGENCY
-            )
+        Args:
+            direction: One of 'up', 'down', 'left', 'right', 'forward', 'back'
+            distance: Distance in centimeters, 20 to 500
 
-            if response is None:
-                raise LandingError("No response received for land command")
-
-            if response == "ok":
-                # Verify landing
-                time.sleep(3)
-                if self.get_height() <= self.MIN_ALTITUDE:
-                    self._status.state = DroneState.LANDED
-                    logger.info("Landing confirmed - drone is on ground")
-                    return True
-            elif "error No valid imu" in response:
-                raise LandingError("Drone reporting unstable conditions during landing - IMU error")
-            else:
-                raise LandingError(f"Unexpected response to land command: {response}")
-            return False
-                
-        except LandingError as e:
-            logger.error(f"Landing error: {e}")
-            # Check if drone actually landed despite the error
-            if self.get_height() <= self.MIN_ALTITUDE:
-                logger.warning("Drone appears to have landed despite command error")
-                self._status.state = DroneState.LANDED
-                return True
-            return False
-
-    def move(self, direction: str, distance: int) -> bool:
-        """Move the drone in a direction"""
-        if direction not in ['up', 'down', 'left', 'right', 'forward', 'back']:
+        Raises:
+            MovementError: If the drone rejected the command
+        """
+        if direction not in ('up', 'down', 'left', 'right', 'forward', 'back'):
             raise ValueError("Invalid direction")
         if not 20 <= distance <= 500:
             raise ValueError("Distance must be between 20 and 500 cm")
 
-        try:
-            response = self._command_handler.send_command(
-                f"{direction} {distance}",
-                priority=CommandPriority.NORMAL
-            )
+        self._send_expect_ok(f"{direction} {int(distance)}", MovementError, self.MOVE_TIMEOUT)
 
-            if response is None:
-                raise MovementError("No response received for movement command")
+    def go(self, x: int, y: int, z: int, speed: int):
+        """
+        Fly to a position relative to the current one
 
-            if response == "ok":
-                logger.info(f"Movement command {direction} {distance}cm completed")
-                return True
-            elif "error No valid imu" in response:
-                raise MovementError("Drone reporting unstable conditions - IMU error") 
-            else:
-                raise MovementError(f"Unexpected response to movement command: {response}")
-            return False
+        Args:
+            x: Distance forward (+) or back (-) in centimeters, -500 to 500
+            y: Distance left (+) or right (-) in centimeters, -500 to 500
+            z: Distance up (+) or down (-) in centimeters, -500 to 500
+            speed: Speed in cm/s, 10 to 100
 
-        except MovementError as e:
-            logger.error(f"Movement error: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Movement command failed: {e}")
-            return False
+        Raises:
+            MovementError: If the drone rejected the command
+        """
+        if not all(-500 <= v <= 500 for v in (x, y, z)):
+            raise ValueError("x, y and z must be between -500 and 500 cm")
+        if all(-20 < v < 20 for v in (x, y, z)):
+            raise ValueError("At least one of x, y and z must be 20 cm or more")
+        if not 10 <= speed <= 100:
+            raise ValueError("Speed must be between 10 and 100 cm/s")
 
-    def rotate(self, direction: str, degrees: int) -> bool:
-        """Rotate the drone"""
-        if direction not in ['cw', 'ccw']:
+        self._send_expect_ok(
+            f"go {int(x)} {int(y)} {int(z)} {int(speed)}", MovementError, self.MOVE_TIMEOUT
+        )
+
+    def rotate(self, direction: str, degrees: int):
+        """
+        Rotate the drone
+
+        Args:
+            direction: 'cw' (clockwise) or 'ccw' (counter-clockwise)
+            degrees: Angle in degrees, 1 to 360
+
+        Raises:
+            RotationError: If the drone rejected the command
+        """
+        if direction not in ('cw', 'ccw'):
             raise ValueError("Invalid rotation direction")
         if not 1 <= degrees <= 360:
             raise ValueError("Degrees must be between 1 and 360")
 
-        try:
-            response = self._command_handler.send_command(
-                f"{direction} {degrees}",
-                priority=CommandPriority.NORMAL
-            )
+        self._send_expect_ok(f"{direction} {int(degrees)}", RotationError, self.MOVE_TIMEOUT)
 
-            if response is None:
-                raise RotationError("No response received for rotation command")
+    def flip(self, direction: str):
+        """
+        Flip the drone
 
-            if response == "ok":
-                logger.info(f"Rotation command {direction} {degrees}° completed")
-                return True
-            elif "error No valid imu" in response:
-                raise RotationError("Drone reporting unstable conditions - IMU error")
-            else:
-                raise RotationError(f"Unexpected response to rotation command: {response}")
-            return False
+        Args:
+            direction: 'l' (left), 'r' (right), 'f' (forward) or 'b' (back)
 
-        except RotationError as e:
-            logger.error(f"Rotation error: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Rotation command failed: {e}")
-            return False
+        Raises:
+            MovementError: If the drone rejected the command
+        """
+        if direction not in ('l', 'r', 'f', 'b'):
+            raise ValueError("Invalid flip direction")
 
-    def set_speed(self, speed: int) -> bool:
-        """Set drone speed"""
-        if not 1 <= speed <= 100:
-            raise ValueError("Speed must be between 1 and 100 cm/s")
+        self._send_expect_ok(f"flip {direction}", MovementError, self.MOVE_TIMEOUT)
 
-        try:
-            response = self._command_handler.send_command(
-                f"speed {speed}",
-                priority=CommandPriority.NORMAL
-            )
+    def send_rc(self, left_right: int = 0, forward_back: int = 0,
+                up_down: int = 0, yaw: int = 0):
+        """
+        Set the drone's velocity, like holding the sticks of a remote control
 
-            if response is None:
-                raise SpeedCommandError("No response received for speed command")
+        This is the command to use for closed-loop control (e.g. following a
+        detected object): it returns immediately and the drone keeps flying
+        at the given velocities until the next call. Values are -100 to 100
+        and are clamped to that range.
 
-            if response == "ok":
-                self._status.speed = speed
-                logger.info(f"Speed set to {speed} cm/s")
-                return True
-            elif "error No valid imu" in response:
-                raise SpeedCommandError("Drone reporting unstable conditions - IMU error")
-            else:
-                raise SpeedCommandError(f"Unexpected response to speed command: {response}")
-            return False
+        Args:
+            left_right: Left (-) / right (+)
+            forward_back: Back (-) / forward (+)
+            up_down: Down (-) / up (+)
+            yaw: Counter-clockwise (-) / clockwise (+)
+        """
+        values = [max(-100, min(100, int(round(v)))) for v in (left_right, forward_back, up_down, yaw)]
+        self._command_handler.send_no_reply("rc {} {} {} {}".format(*values))
 
-        except SpeedCommandError as e:
-            logger.error(f"Speed command error: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Speed command failed: {e}")
-            return False
+    def hover(self):
+        """Stop any motion started with send_rc() and hover in place"""
+        self.send_rc(0, 0, 0, 0)
+
+    def set_speed(self, speed: int):
+        """
+        Set the speed used by move() in cm/s, 10 to 100
+
+        Raises:
+            SpeedCommandError: If the drone rejected the command
+        """
+        if not 10 <= speed <= 100:
+            raise ValueError("Speed must be between 10 and 100 cm/s")
+
+        self._send_expect_ok(f"speed {int(speed)}", SpeedCommandError, retries=2)
 
     def get_speed(self) -> int:
-        """Get current speed in centimeters per second"""
+        """
+        Get the speed used by move() in centimeters per second
+
+        Raises:
+            SpeedCommandError: If the response could not be understood
+        """
+        response = self.send_command("speed?", retries=2)
         try:
-            response = self._command_handler.send_command(
-                "speed?",
-                priority=CommandPriority.LOW
-            )
+            return int(float(response))
+        except ValueError:
+            raise SpeedCommandError(f"Could not parse speed from response: {response}") from None
 
-            if response is None:
-                raise SpeedCommandError("No response received for speed query")
+    # ------------------------------------------------------------------
+    # Video
+    # ------------------------------------------------------------------
 
-            speed = self._parse_speed(response)
-            if speed is not None:
-                self._status.speed = speed  # Update cached speed
-                return speed
-            else:
-                raise SpeedCommandError(f"Could not parse speed from response: {response}")
-            return False
+    def start_video_stream(self, timeout: float = 15.0,
+                           frame_callback: Optional[Callable[[np.ndarray], None]] = None):
+        """
+        Start the video stream and wait for it to stabilize
 
-        except SpeedCommandError as e:
-            logger.error(f"Speed query error: {e}")
-            return self._status.speed
-        except Exception as e:
-            logger.error(f"Speed query failed: {e}")
-            return self._status.speed
+        Args:
+            timeout: Maximum time to wait for stable stream in seconds
+            frame_callback: Optional callback invoked with every frame on the
+                video thread. Most code should use frames() or get_frame().
 
-    def get_battery(self) -> int:
-        """Get battery percentage"""
-        return self._status.battery
+        Raises:
+            VideoStreamError: If the stream did not start
+        """
+        self._send_expect_ok("streamon", retries=2)
+        self._video.start(frame_callback=frame_callback, timeout=timeout)
 
-    def get_height(self) -> int:
-        """Get current height in centimeters"""
-        return self._status.altitude
-
-    def get_status(self) -> DroneStatus:
-        """Get current drone status"""
-        return self._status
+    def stop_video_stream(self):
+        """Stop the video stream"""
+        self._video.stop()
+        self._send_expect_ok("streamoff", retries=2)
 
     def get_frame(self) -> Optional[np.ndarray]:
-        """Get the latest video frame"""
+        """Get the latest video frame as a BGR image, None if there is none yet"""
         return self._video.get_frame()
+
+    def frames(self, timeout: float = 5.0) -> Iterator[np.ndarray]:
+        """
+        Iterate over video frames as they arrive
+
+        Each frame is yielded at most once and frames are skipped if the loop
+        body is slower than the stream, so this is the natural way to feed a
+        detector::
+
+            for frame in drone.frames():
+                results = model(frame)
+
+        The iterator ends when the video stream is stopped.
+
+        Raises:
+            VideoStreamError: If no new frame arrives within the timeout
+        """
+        return self._video.frames(timeout=timeout)

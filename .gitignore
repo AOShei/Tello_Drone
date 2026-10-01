@@ -1,4 +1,9 @@
 *.egg-info/
+build/
+dist/
 venv/
+.venv/
 __pycache__/
 *.pyc
+# Model weights downloaded by detectors such as YOLO
+*.pt
